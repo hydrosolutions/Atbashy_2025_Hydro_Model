@@ -1,0 +1,513 @@
+---
+title: "Hydrological Modeling in Atbashy River Basin: Hydrological Modeling (airGR)"
+author: "Tobias Siegfried, hydrosolutions GmbH"
+format: html
+editor: source
+date: "2025-04-29"
+---
+
+# I. BACKGROUND
+
+## Hydrological Modeling in Atbashy River Basin
+
+### Introduction
+
+This script implements a hydrological modeling framework to simulate discharge in Atbashy River Basin, Kyrgyzstan, using the airGR package. The modeling framework is designed to integrate various data sources and methodologies to provide a comprehensive understanding of the hydrological processes in the basin. The primary focus is on simulating the hydrological response to 2017 - 2023 forcing, i.e., the years of the focus of the study by Hannah Schwedhelm.
+
+#### Key Components
+
+1. **Model Structure**
+   - Uses the airGR package's CemaNeige model coupled with GR4J
+   - Implements elevation band discretization to account for orographic effects
+   - Incorporates glacier melt contributions using Rounce et al. (2023) projections
+   - Handles snow/rain partitioning using the Glazirin method calibrated for Central Asian conditions
+
+2. **Data Integration**
+   - Historical climate observations for model forcing
+   - Monthly discharge measurements for calibration and validation of mean monthly flows
+   - Glacier melt data with temperature-based temporal disaggregation
+   - Elevation band-specific precipitation and temperature data
+
+3. **Modeling Framework**
+   - Split-sample calibration and validation approach
+   - Multi-criteria performance evaluation
+   - Latin Hypercube Sampling for parameter uncertainty analysis
+   - Specific focus on snow/rain transition parameterization
+
+#### Objectives
+
+The primary objectives of this modeling exercise are to:
+1. Establish a robust hydrological model for the Atbashy River Basin
+2. Account for the significant role of snow and glacier melt in the basin's hydrology
+3. Provide insights into parameter sensitivity and model uncertainty
+
+This script is a spin off of a larger climate change impact assessment project and builds upon previous data preparation work documented in separate scripts. It is the first time that we try to implement a full modeling chain in R only without RSMINERVE but with airGR. The script is designed to be modular and adaptable, allowing for easy updates and modifications as new data becomes available or as modeling techniques evolve.
+
+Challenge: We only have monthly observations and airGR presumes daily observations.How to deal with this?
+
+
+# II. Change Log
+- **2024-11-19**:
+  - Initial setup.
+- **2024-11-20**:
+  - Integration with the data preparation script.
+- **2024-11-21**:
+  - Simple monthly to daily glacier melt data disaggregation implemented.
+  - Testing the teaching package.
+- **2024-11-24**:
+  - continuing investigation into CEMA-Neige.
+- **2024-11-25**: 
+  - Way forward is clear. airGR::CreateInputsModel produces elevation bands specific model input. We can just overwrite the results from the data_preparation.qmd script where we have prepared elevation band data for P and T. 
+- **2024-11-26**:
+  - Continuing with hydro modeling using airGR.
+  - The temperature to peak discharge sensitivity is stunning. We get a good calibration during the summer months if we lower the 'observed' temperatures by 10°C. On the plot with the rolling mean, the calibrated peak discharge coincides well with the observed discharge. However, under such scheme, the winter discharge is mostly overestimated. This sensitivity shows the importance of 'bias correcting' the CHELSA V21 temperature fields.
+- **2024-11-28**:
+  - Progressing on climate impact implementation
+  - functions now in separate R scripts. The deep rationale for this was to be able to provide them as context to Claude. It does not work with .qmd script files.
+- **2024-11-29**:
+  - Running climate simulations now and starting to analyze outputs.
+  - Export of relevant results for later analysis.    
+- **2024-12-02**:
+  - Streamlining code and improving documentation.
+- **2024-12-03**:
+  - Need for resetting snow every 5 years to avoid issue with snow accumulation in high elevation catchments. 
+- **2024-12-04**:
+  - Code updated. Results looking good.
+  - Added shiny figure plotting.
+- **2024-12-06**:
+  - Finalizing the script for error checking. It fully replaces the climate impact analysis script.
+- **2025-02-27**:
+  - Validating code and crosschecking if all works.
+- **2025-03-06**:
+  - Preparing script for use with Positron IDE.
+- **2025-04-28**:
+  - Adaptation for Atbashy hydrological modeling study
+- **2025-04-29**:
+  - Working on the calibration of the GR4J model with daily inputs and monthly discharge observations.
+
+# 1. CONFIGURATIONS & FUNCTIONS
+
+## 1.0 Configurations
+
+```{r}
+# Load the centralized configuration
+library(pacman)
+p_load(here, tidyverse, lubridate)
+
+path = here::here("01_code", "config_param.R")
+source(path)
+```
+
+## 1.0 Source functions
+
+```{r}
+source(here::here("01_code", "functions", "disaggregate_glacier_melt.R"))
+source(here::here("01_code", "functions", "solid_fraction_elevation_layer.R"))
+source(here::here("01_code", "functions", "process_rsminerve_climate_files.R"))
+source(here::here("01_code", "functions", "process_glacier_data.R"))
+source(here::here("01_code", "functions", "plot_calib_valid_period.R"))
+source(here::here("01_code", "functions", "create_basin_scenario_model_ts.R"))
+source(here::here("01_code", "functions", "process_inputs_models_scenarios.R"))
+source(here::here("01_code", "functions", "run_climate_scenarios.R"))
+source(here::here("01_code", "functions", "plot_flexible_hydrograph.R"))
+source(here::here("01_code", "functions", "calculate_exceedance.R"))
+source(here::here("01_code", "functions", "plot_exceedance.R"))
+source(here::here("01_code", "functions", "ErrorCrit_NSE_Monthly.R"))
+```
+
+# 2. PARAMETERS & DATA
+
+## 2.1 Parameters
+
+Loading data that was produced in the data preparation script. This includes the basin information and the calibration/validation periods. 
+
+```{r}
+# Basin information
+Basin_Info <- read_rds(file.path(config$paths$data_path, "Basin_Info.rds"))
+Basin_Info |> summary()
+
+# time periods and calibration/validation periods
+cal_val_per <- readRDS(file.path(config$paths$data_path, "Calibration_Validation_Period.rds"))
+cal_val_per |> summary()
+
+# Snow reset level and threshold. This is the level at which the snow is reset in the model at the end of a simulation period chunk. This is important to avoid consistent snow accumulation in high elevation catchments. All is in mm.
+snow_reset_level <- 0 # mm
+snow_reset_threshold <- 1000 # mm
+```
+
+## 2.2 Data
+
+### Discharge Data (HIST_OBS)
+
+Setting up monthly discharge data. 
+
+```{r}
+#| warning: false
+
+q <- readRDS(file.path(paste0(config$paths$data_path,"/Discharge"), "q_cal_val.rds"))
+
+# set date column to first day of month
+q <- q |> 
+  mutate(date = ymd(date)) |> 
+  mutate(date = floor_date(date, "month"))
+
+# Add specific discharge in mm/day
+q <- q |> 
+  rename(Q_m3_sec = value) |>
+  mutate(Q_mm_day = Q_m3_sec / as.numeric(Basin_Info$BasinArea_m2) * 10^3 * 3600 * 24) |> 
+  dplyr::select(-data)
+
+# Add/Update period information
+## Filter out data prior to 1979-01-01
+q <- q[complete.cases(q), ]
+
+## Set warmup period
+n_warmup_years <- 3
+
+## reset labels
+q <- q %>%
+  mutate(Period = case_when(
+    date < cal_val_per$calib_start + years(n_warmup_years) - days(1) ~ "Warmup",
+    date >= cal_val_per$calib_start & date <= cal_val_per$calib_end ~ "Calibration",
+    date > cal_val_per$valid_start & date <= cal_val_per$valid_end ~ "Validation"
+  ))
+
+plot_calib_valid_period(q)
+
+# summarize by time compute annual discharge stats
+q |> 
+  group_by(Period) |>  
+  timetk::summarize_by_time(.date_var = date, .by = "year", 
+                            Q_mm_day = sum(Q_mm_day) * 3600 * 24 * 365.25 / 10^9) |> 
+  summary()
+```
+
+### Forcing Data (HIST_OBS)
+
+Here, we load hist_obs forcing data and then average over the elevation bands. 
+Depending on the availability of station data, we can correct the CHELSA V21 forcing fields. 
+
+```{r}
+#| warning: false
+#| echo: false
+
+hist_obs <- read_csv(file.path(config$paths$model_dir, "forcing/hist_obs_rsm.csv"), 
+                     col_names = FALSE,
+                     show_col_types = FALSE) 
+# delete the last column in hist_obs (discharge measured at the gauge) for hist_obs
+hist_obs <- hist_obs %>% dplyr::select(-ncol(hist_obs)) 
+
+hist_obs_processed <- process_rsminerve_climate_files(hist_obs)
+
+dates_tbl <- hist_obs_processed$dates
+hist_obs_T_bands <- hist_obs_processed$T_bands
+hist_obs_P_bands <- hist_obs_processed$P_bands
+
+hist_obs_T <- hist_obs_T_bands |> rowMeans()
+hist_obs_P <- hist_obs_P_bands |> rowMeans()
+```
+
+### Glacier Data (HIST_OBS)
+
+Subtract the monthly Rounce et al. 2023 data from the monthly discharge data of the hist_obs period and create net discharge time series.
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: false
+
+# Load the glacier data
+qg_mon <- read_csv(file = file.path(config$paths$glacier_path, "glaciers_hist_obs_rsm.csv"))
+qg_mon <- qg_mon |> 
+  slice(-1:-7)# Remove the first 7 rows
+
+# Now rename and calculate
+qg_mon <- qg_mon %>% 
+  rename(Q_m3_sec = `Glacier 16076`) %>%  # Note the backticks for column names with spaces
+  rename(date = Station) |> 
+  mutate(Q_m3_sec = as.numeric(Q_m3_sec),  # Ensure the column is numeric
+         Q_mm_day = Q_m3_sec / as.numeric(Basin_Info$BasinArea_m2) * 10^3 * 3600 * 24)
+
+monthly_melt <- qg_mon |> 
+  dplyr::select(date, Q_mm_day) |> rename(melt = Q_mm_day) |> 
+  mutate(date = dmy_hms(date)) |> 
+  mutate(date = date(date)) #|>
+  #mutate(date = ceiling_date(date, "month") - days(1))
+
+```
+
+### Discharge net Glacier Melt
+
+```{r}
+monthly_melt
+
+q <- q |> 
+  left_join(monthly_melt, by = "date") |> 
+  mutate(melt = ifelse(is.na(melt), 0, melt)) |> 
+  mutate(Q_net_melt_mm_day = Q_mm_day - melt)
+
+# plot Q_net_melt_mm_day time series
+q |> 
+  dplyr::select(date, Q_net_melt_mm_day, melt) |> 
+  pivot_longer(-date) |> 
+  #group_by(name) |> 
+  timetk::plot_time_series(.date_var = date, .value = value, 
+                   .smooth = FALSE, .color_var = name,
+                   .title = "Discharge without Glacier Contribution")
+```
+
+### Final Dataframe via combination of data
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: false
+
+# Combine the data
+forcing_q_ts <- data.frame(date = dates_tbl$value, 
+                         #julian day
+                         JourJul = yday(dates_tbl$value),
+                         Ptot = hist_obs_P, 
+                         Temp = hist_obs_T) 
+
+# add discharge
+
+q_net_melt_mm_day <- q %>% dplyr::select(date,Q_net_melt_mm_day)
+
+forcing_q_ts <- forcing_q_ts |> 
+  left_join(q_net_melt_mm_day, by = "date") |> 
+  rename(Q_mm_day = Q_net_melt_mm_day)
+
+# compute potential ET using Oudin method
+PET = airGR::PE_Oudin(JD = forcing_q_ts$JourJul, 
+                      Temp = forcing_q_ts$Temp, 
+                      Lat = Basin_Info$BasinLat_rad, 
+                      LatUnit = "rad", 
+                      TimeStepIn = "daily", 
+                      TimeStepOut = "daily")
+
+# bind all together
+forcing_q_ts <- cbind(forcing_q_ts, PET = PET)
+
+# visualize
+forcing_q_ts |> 
+  dplyr::select(date, Q_mm_day, Ptot, Temp, PET) |>
+  pivot_longer(cols = c(Q_mm_day, Ptot, Temp, PET), names_to = "Variable", values_to = "Value") |> 
+  # generate an interactive plot
+  ggplot(aes(x = date, y = Value, group = Variable)) +
+  geom_line(aes(color = Variable)) +
+  geom_point(aes(color = Variable)) +
+  labs(x = "Date", y = "Value", color = "Variables") +
+  theme_minimal()
+
+# save as csv on disc
+write_csv(forcing_q_ts, file.path(config$paths$model_dir, "forcing_q_ts.csv"))
+```
+
+# 3. MODEL
+
+## 3.0 Getting started
+```{r}
+# Load the data
+basin_obs_ts <- forcing_q_ts |> 
+  rename(Q_mm_day_no_glacier = Q_mm_day)
+
+# setting calib_end
+cal_val_per$calib_end <- ymd(cal_val_per$calib_end)
+
+# indexing calibration time steps
+indRun_cal <- which(basin_obs_ts$date >= cal_val_per$calib_start & 
+                      basin_obs_ts$date <= cal_val_per$calib_end)
+indRun_cal_max <- indRun_cal |> max()
+
+# model to use 
+model_2_use <- "GR4J"
+
+if (model_2_use == "GR4J") {
+  fun_model <- airGR::RunModel_CemaNeigeGR4J
+} else if (model_2_use == "GR5J") {
+  fun_model <- airGR::RunModel_CemaNeigeGR5J
+} else if (model_2_use == "GR6J") {
+  fun_model <- airGR::RunModel_CemaNeigeGR6J
+}
+
+# warmup period
+n_warmup_years <- 3
+warmup_period_ind <- 1:(365*n_warmup_years + 1)
+# calibration period
+indRun_cal <- indRun_cal + length(warmup_period_ind)
+indRun_cal <- indRun_cal[indRun_cal<=indRun_cal_max] # this makes sure that we remain < calib_end period
+# validation period
+indRun_val <- which(basin_obs_ts$date >= cal_val_per$valid_start & 
+                      basin_obs_ts$date <= cal_val_per$valid_end)
+
+# transformation
+transfo = ""
+
+# performance criteria
+fun_crit = airGR::ErrorCrit_NSE
+weights = c(1)
+
+#fun_crit = list(ErrorCrit_NSE, ErrorCrit_RMSE)
+#weights = c(1/2, 1/2)
+
+# observation
+q_obs_cal = basin_obs_ts$Q_mm_day_no_glacier[indRun_cal]
+q_obs_val = basin_obs_ts$Q_mm_day_no_glacier[indRun_val]
+```
+
+
+## 3.1 Prepare Model
+
+Note: We ran the parameter optimization experiment in the X.EXPERIMENT section below. The best parameters for tas_min and tas_max were found to be 8.56 and 9.97, respectively.
+
+```{r}
+
+basin_obs_ts <- forcing_q_ts
+
+# preparation of input data
+inputsModel <- airGR::CreateInputsModel(FUN_MOD            = fun_model, 
+                                        DatesR             = basin_obs_ts$date,
+                                        Precip             = basin_obs_ts$Ptot, 
+                                        PotEvap            = basin_obs_ts$PET,
+                                        TempMean           = basin_obs_ts$Temp, 
+                                        HypsoData          = Basin_Info$HypsoData,
+                                        ZInputs            = median(Basin_Info$HypsoData),
+                                        NLayers            = length(Basin_Info$ZLayers))
+
+# overwrite airGR CemaNeige elevation bands data with our own.
+inputsModel_ours <- inputsModel
+inputsModel_ours$LayerTempMean <- hist_obs_T_bands |> as.list() 
+inputsModel_ours$LayerPrecip <- hist_obs_P_bands |> as.list()
+
+# compute the fraction of solid precipitation on the layer. # tas_min and tas_max are the best parameters found in the experiment under Section X below.
+
+tas <- c(0.213, 0.489) # tas_min and tas_max are the best parameters found in the experiment under Section X below.
+#tas <- c(9.1,10)
+
+solid_frac_pr <- solid_fraction_elevation_layer(Basin_Info,
+                                                  inputsModel_ours$LayerTempMean, 
+                                                  tas_min  = tas[1], 
+                                                  tas_max  = tas[2]) 
+
+inputsModel_ours$LayerFracSolidPrecip <- solid_frac_pr
+# overwrite original
+inputsModel <- inputsModel_ours
+
+# What we are doing here is to overwrite the setup prepared in the airGR::CreateInputsModel() script. In other words, we just use the data from the data_preparation script.
+runOptions_cal <- airGR::CreateRunOptions(FUN_MOD          = fun_model,
+                                          InputsModel      = inputsModel,
+                                          IndPeriod_Run    = indRun_cal,
+                                          IniStates        = NULL,
+                                          IniResLevels     = NULL,
+                                          IndPeriod_WarmUp = warmup_period_ind,
+                                          IsHyst           = FALSE,
+                                          warnings         = FALSE,
+                                          Outputs_Sim      = "Qsim")
+ 
+inputsCrit_cal <- airGR::CreateInputsCrit(FUN_CRIT         = fun_crit,
+                                          InputsModel      = inputsModel,
+                                          RunOptions       = runOptions_cal,
+                                          transfo          = transfo,
+                                          Obs              = q_obs_cal,
+                                          warnings         = FALSE,
+                                          Weights          = weights)
+
+calibOptions <- airGR::CreateCalibOptions(FUN_MOD          = fun_model, 
+                                          FUN_CALIB        = airGR::Calibration_Michel)
+```
+
+
+## 3.2 Model Calibration
+
+```{r}
+#| warnings: off
+
+outputsCalib <- airGR::Calibration_Michel(InputsModel      = inputsModel,
+                                   RunOptions              = runOptions_cal,
+                                   InputsCrit              = inputsCrit_cal,
+                                   CalibOptions            = calibOptions,
+                                   FUN_MOD                 = fun_model)
+```
+
+# 4. RESULTS
+
+## 4.1 Calibration Results
+```{r}
+# calibration period
+param <- outputsCalib$ParamFinalR
+
+# switch call of function depending on fun_model
+if (model_2_use == "GR4J") {
+  runResults_cal <- airGR::RunModel_CemaNeigeGR4J(InputsModel     = inputsModel,
+                                           RunOptions      = runOptions_cal,
+                                           Param           = param)
+} else if (model_2_use == "GR5J") {
+  runResults_cal <- airGR::RunModel_CemaNeigeGR5J(InputsModel     = inputsModel,
+                                           RunOptions      = runOptions_cal,
+                                           Param           = param)
+} else if (model_2_use == "GR6J") {
+  runResults_cal <- airGR::RunModel_CemaNeigeGR6J(InputsModel     = inputsModel,
+                                           RunOptions      = runOptions_cal,
+                                           Param           = param)
+}
+
+plot(runResults_cal, Qobs = basin_obs_ts$Q_mm_day[indRun_cal])
+
+OutputsCrit <- airGR::ErrorCrit_NSE(InputsCrit = inputsCrit_cal, OutputsModel = runResults_cal)
+#OutputsCrit
+
+dev.off() # required in Positron
+```
+
+## 4.2 Validation Period
+
+```{r}
+runOptions_val <- airGR::CreateRunOptions(FUN_MOD          = fun_model,
+                                          InputsModel      = inputsModel,
+                                          IndPeriod_Run    = indRun_val,
+                                          IniStates        = runResults_cal$StateEnd,
+                                          IniResLevels     = NULL)
+
+inputsCrit_val <- airGR::CreateInputsCrit(FUN_CRIT         = fun_crit,
+                                          InputsModel      = inputsModel,
+                                          RunOptions       = runOptions_val,
+                                          transfo          = transfo,
+                                          Obs              = q_obs_val,
+                                          Weights          = weights)
+
+# switch call of function depending on fun_model
+if (model_2_use == "GR4J") {
+  runResults_val <- airGR::RunModel_CemaNeigeGR4J(InputsModel     = inputsModel,
+                                           RunOptions      = runOptions_val,
+                                           Param           = param)
+} else if (model_2_use == "GR5J") {
+  runResults_val <- airGR::RunModel_CemaNeigeGR5J(InputsModel     = inputsModel,
+                                           RunOptions      = runOptions_val,
+                                           Param           = param)
+} else if (model_2_use == "GR6J") {
+  runResults_val <- airGR::RunModel_CemaNeigeGR6J(InputsModel     = inputsModel,
+                                           RunOptions      = runOptions_val,
+                                           Param           = param)
+}
+
+plot(runResults_val, Qobs = basin_obs_ts$Q_mm_day[indRun_val])
+
+# BELOW SAVE FIGURE DOES NOT WORK
+# # save figure on disc
+# ggsave("validation_period.png", 
+#        plot = p,
+#        path = config$paths$figures_dir,
+#        width = 10, height = 5,
+#        dpi = 600)
+
+OutputsCrit <- airGR::ErrorCrit_NSE(InputsCrit = inputsCrit_val, OutputsModel = runResults_val)
+#OutputsCrit
+
+dev.off() # required in Positron
+```
+
+
+
+
+
