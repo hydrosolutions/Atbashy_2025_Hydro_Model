@@ -87,6 +87,8 @@ Challenge: We only have monthly observations and airGR presumes daily observatio
 - **2025-04-30**:
   - Switched to LHS optimization for parameter calibration. First Claude Version available for testing now.
 
+# ===============================
+
 # 1. CONFIGURATIONS & FUNCTIONS
 
 ## 1.0 Configurations
@@ -100,7 +102,7 @@ path = here::here("01_code", "config_param.R")
 source(path)
 ```
 
-## 1.0 Source functions
+## 1.1 Source functions
 
 ```{r}
 source(here::here("01_code", "functions", "disaggregate_glacier_melt.R"))
@@ -422,7 +424,7 @@ calibOptions <- airGR::CreateCalibOptions(FUN_MOD          = fun_model,
 ```
 
 
-# 4 Model Calibration
+# 4. MODEL CALIBRATION
 
 ## Step 1: Load Required Libraries
 
@@ -547,23 +549,34 @@ Run model with best parameters.
 best_params <- calibration_results$best_params
 param_vector <- unlist(best_params)  |> unname()# Convert from list to vector
 
+# new run options to output everything
+runOptions_run <- airGR::CreateRunOptions(FUN_MOD          = fun_model,
+                                          InputsModel      = inputsModel,
+                                          IndPeriod_Run    = indRun_cal,
+                                          IniStates        = NULL,
+                                          IniResLevels     = NULL,
+                                          IndPeriod_WarmUp = warmup_period_ind,
+                                          IsHyst           = FALSE,
+                                          warnings         = FALSE,
+                                          Outputs_Sim      = "all")
+
 # Choose the appropriate model function based on your model_type
 if (model_2_use == "GR4J") {
   best_run_cal <- airGR::RunModel_CemaNeigeGR4J(
     InputsModel = inputsModel,
-    RunOptions = runOptions_cal,
+    RunOptions = runOptions_run,
     Param = param_vector
   )
 } else if (model_2_use == "GR5J") {
   best_run_cal <- airGR::RunModel_CemaNeigeGR5J(
     InputsModel = inputsModel,
-    RunOptions = runOptions_cal,
+    RunOptions = runOptions_run,
     Param = param_vector
   )
 } else if (model_2_use == "GR6J") {
   best_run_cal <- airGR::RunModel_CemaNeigeGR6J(
     InputsModel = inputsModel,
-    RunOptions = runOptions_cal,
+    RunOptions = runOptions_run,
     Param = param_vector
   )
 }
@@ -637,7 +650,7 @@ plot_monthly_comparison(
 # Plot parameter uncertainty bands
 plot_parameter_uncertainty(
   calibration_results,
-  n_best = 10,                 # Use top 10 parameter sets
+  n_best = 100,                 # Use top 10 parameter sets
   inputsModel = inputsModel,
   runOptions = runOptions_cal,
   obs_monthly = obs_monthly_cal,
@@ -645,6 +658,11 @@ plot_parameter_uncertainty(
 )
 ```
 
+# 5. RUN MODEL from 2000 - 2024
+
+```{r}
+
+```
 
 
 
