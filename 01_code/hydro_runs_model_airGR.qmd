@@ -3,7 +3,7 @@ title: "Hydrological Modeling in Atbashy River Basin: Hydrological Modeling (air
 author: "Tobias Siegfried, hydrosolutions GmbH"
 format: html
 editor: source
-date: "2025-04-29"
+date: "2025-04-30"
 ---
 
 # I. BACKGROUND
@@ -84,6 +84,8 @@ Challenge: We only have monthly observations and airGR presumes daily observatio
   - Adaptation for Atbashy hydrological modeling study
 - **2025-04-29**:
   - Working on the calibration of the GR4J model with daily inputs and monthly discharge observations.
+- **2025-04-30**:
+  - Switched to LHS optimization for parameter calibration. First Claude Version available for testing now.
 
 # 1. CONFIGURATIONS & FUNCTIONS
 
@@ -305,7 +307,7 @@ write_csv(forcing_q_ts, file.path(config$paths$model_dir, "forcing_q_ts.csv"))
 
 # 3. MODEL
 
-## 3.0 Getting started
+## 3.0 Model Specific Setup
 ```{r}
 # Load the data
 basin_obs_ts <- forcing_q_ts |> 
@@ -430,17 +432,16 @@ Load data and prepare model structure (see above).
 
 ```{r}
 # Load discharge data
-q <- readRDS(file.path(paste0(config$paths$data_path,"/Discharge"), "q_cal_val.rds"))
-q <- q |> 
-  mutate(date = ymd(date)) |> 
-  mutate(date = floor_date(date, "month")) |>
-  rename(Q_m3_sec = value) |>
-  mutate(Q_mm_day = Q_m3_sec / as.numeric(Basin_Info$BasinArea_m2) * 10^3 * 3600 * 24)
+#q <- readRDS(file.path(paste0(config$paths$data_path,"/Discharge"), "q_cal_val.rds"))
+#q <- q |> 
+#  mutate(date = ymd(date)) |> 
+#  mutate(date = floor_date(date, "month")) |>
+#  rename(Q_m3_sec = value) |>
+#  mutate(Q_mm_day = Q_m3_sec / as.numeric(Basin_Info$BasinArea_m2) * 10^3 * 3600 * 24)
 
 # Extract calibration period observations
 obs_monthly_cal <- q %>%
   filter(date >= cal_val_per$calib_start & date <= cal_val_per$calib_end)
-obs_monthly_cal
 ```
 
 ## Step 3: Define Parameter Ranges
@@ -448,12 +449,12 @@ obs_monthly_cal
 ```{r}
 # For GR4J + CemaNeige
 param_ranges <- list(
-  X1 = c(100, 1200),            # Production store capacity (mm)
+  X1 = c(100, 12000),            # Production store capacity (mm)
   X2 = c(-5, 5),                # Groundwater exchange coefficient (mm/day)
   X3 = c(20, 300),              # Routing store capacity (mm)
-  X4 = c(0.5, 5),               # Unit hydrograph time constant (days)
+  X4 = c(1, 10),               # Unit hydrograph time constant (days)
   CemaNeigeParam1 = c(0.5, 2),  # Snow melt temperature factor
-  CemaNeigeParam2 = c(0.5, 2)   # Snow cold content factor
+  CemaNeigeParam2 = c(0.5, 200)   # Snow cold content factor
 )
 ```
 
@@ -516,15 +517,19 @@ eval_function_wrapper <- function(model_results) {
 
 ```{r}
 # Run calibration
+
+set.seed(111)
+
 calibration_results <- adaptive_lhs_calibration(
   run_model = run_model_wrapper,
   eval_function = eval_function_wrapper,
   param_ranges = param_ranges,
-  n_initial_samples = 500,    # Number of initial samples
-  n_iterations = 300,          # Number of refinement iterations
-  refinement_factor = 0.2,   # Top 20% used for refinement
-  n_refined_samples = 30,    # Samples per refinement
-  parallel = TRUE           # Set to TRUE for parallel processing
+  n_initial_samples = 1000,    # Number of initial samples
+  n_iterations = 100,          # Number of refinement iterations
+  refinement_factor = .1,   # Top 10% used for refinement
+  n_refined_samples = 100,    # Samples per refinement
+  parallel = FALSE,           # Set to TRUE for parallel processing
+  n_cores = 9
 )
 
 # Extract best parameters
@@ -534,6 +539,34 @@ best_performance <- calibration_results$best_performance
 # Display results
 print(best_params)
 print(paste("Best NSE:", best_performance))
+```
+Run model with best parameters.
+
+```{r}
+# After extracting best parameters from calibration_results
+best_params <- calibration_results$best_params
+param_vector <- unlist(best_params)  |> unname()# Convert from list to vector
+
+# Choose the appropriate model function based on your model_type
+if (model_2_use == "GR4J") {
+  best_run_cal <- airGR::RunModel_CemaNeigeGR4J(
+    InputsModel = inputsModel,
+    RunOptions = runOptions_cal,
+    Param = param_vector
+  )
+} else if (model_2_use == "GR5J") {
+  best_run_cal <- airGR::RunModel_CemaNeigeGR5J(
+    InputsModel = inputsModel,
+    RunOptions = runOptions_cal,
+    Param = param_vector
+  )
+} else if (model_2_use == "GR6J") {
+  best_run_cal <- airGR::RunModel_CemaNeigeGR6J(
+    InputsModel = inputsModel,
+    RunOptions = runOptions_cal,
+    Param = param_vector
+  )
+}
 ```
 
 ## Step 6: Visualize Calibration Results
@@ -610,99 +643,6 @@ plot_parameter_uncertainty(
   obs_monthly = obs_monthly_cal,
   model_type = "GR4J"
 )
-```
-
-
-
-## Old Calibration
-
-
-
-```{r}
-#| warnings: off
-
-outputsCalib <- airGR::Calibration_Michel(InputsModel      = inputsModel,
-                                   RunOptions              = runOptions_cal,
-                                   InputsCrit              = inputsCrit_cal,
-                                   CalibOptions            = calibOptions,
-                                   FUN_MOD                 = fun_model)
-```
-
-# 4. RESULTS
-
-## 4.1 Calibration Results
-```{r}
-# calibration period
-param <- outputsCalib$ParamFinalR
-
-# switch call of function depending on fun_model
-if (model_2_use == "GR4J") {
-  runResults_cal <- airGR::RunModel_CemaNeigeGR4J(InputsModel     = inputsModel,
-                                           RunOptions      = runOptions_cal,
-                                           Param           = param)
-} else if (model_2_use == "GR5J") {
-  runResults_cal <- airGR::RunModel_CemaNeigeGR5J(InputsModel     = inputsModel,
-                                           RunOptions      = runOptions_cal,
-                                           Param           = param)
-} else if (model_2_use == "GR6J") {
-  runResults_cal <- airGR::RunModel_CemaNeigeGR6J(InputsModel     = inputsModel,
-                                           RunOptions      = runOptions_cal,
-                                           Param           = param)
-}
-
-plot(runResults_cal, Qobs = basin_obs_ts$Q_mm_day[indRun_cal])
-
-OutputsCrit <- airGR::ErrorCrit_NSE(InputsCrit = inputsCrit_cal, OutputsModel = runResults_cal)
-#OutputsCrit
-
-dev.off() # required in Positron
-```
-
-## 4.2 Validation Period
-
-```{r}
-runOptions_val <- airGR::CreateRunOptions(FUN_MOD          = fun_model,
-                                          InputsModel      = inputsModel,
-                                          IndPeriod_Run    = indRun_val,
-                                          IniStates        = runResults_cal$StateEnd,
-                                          IniResLevels     = NULL)
-
-inputsCrit_val <- airGR::CreateInputsCrit(FUN_CRIT         = fun_crit,
-                                          InputsModel      = inputsModel,
-                                          RunOptions       = runOptions_val,
-                                          transfo          = transfo,
-                                          Obs              = q_obs_val,
-                                          Weights          = weights)
-
-# switch call of function depending on fun_model
-if (model_2_use == "GR4J") {
-  runResults_val <- airGR::RunModel_CemaNeigeGR4J(InputsModel     = inputsModel,
-                                           RunOptions      = runOptions_val,
-                                           Param           = param)
-} else if (model_2_use == "GR5J") {
-  runResults_val <- airGR::RunModel_CemaNeigeGR5J(InputsModel     = inputsModel,
-                                           RunOptions      = runOptions_val,
-                                           Param           = param)
-} else if (model_2_use == "GR6J") {
-  runResults_val <- airGR::RunModel_CemaNeigeGR6J(InputsModel     = inputsModel,
-                                           RunOptions      = runOptions_val,
-                                           Param           = param)
-}
-
-plot(runResults_val, Qobs = basin_obs_ts$Q_mm_day[indRun_val])
-
-# BELOW SAVE FIGURE DOES NOT WORK
-# # save figure on disc
-# ggsave("validation_period.png", 
-#        plot = p,
-#        path = config$paths$figures_dir,
-#        width = 10, height = 5,
-#        dpi = 600)
-
-OutputsCrit <- airGR::ErrorCrit_NSE(InputsCrit = inputsCrit_val, OutputsModel = runResults_val)
-#OutputsCrit
-
-dev.off() # required in Positron
 ```
 
 

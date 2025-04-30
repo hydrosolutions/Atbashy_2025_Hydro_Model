@@ -110,7 +110,8 @@ source(here::here("01_code", "functions", "run_climate_scenarios.R"))
 source(here::here("01_code", "functions", "plot_flexible_hydrograph.R"))
 source(here::here("01_code", "functions", "calculate_exceedance.R"))
 source(here::here("01_code", "functions", "plot_exceedance.R"))
-source(here::here("01_code", "functions", "ErrorCrit_NSE_Monthly.R"))
+source(here::here("01_code", "functions", "adaptive_lhs_calibration.R"))
+source(here::here("01_code", "functions", "parameter_space_visualization_functions.R"))
 ```
 
 # 2. PARAMETERS & DATA
@@ -304,36 +305,7 @@ write_csv(forcing_q_ts, file.path(config$paths$model_dir, "forcing_q_ts.csv"))
 
 # 3. MODEL
 
-## 3X Claude Model
-
-```{r}
-#| echo: false
-#| message: false
-#| warning: false
-
-source(here::here("01_code", "functions", "calculate_monthly_nse"))
-source(here::here("01_code", "functions", "get_monthly_obs.R"))
-source(here::here("01_code", "functions", "run_model_with_params.R"))
-source(here::here("01_code", "functions", "manual_calibration.R"))
-source(here::here("01_code", "functions", "plot_monthly_comparison.R"))
-
-n_samples <- 50
-
-# Run manual calibration
-param <- manual_calibration(n_samples)
-param
-
-# Plot monthly comparison for calibration period
-plot_monthly_comparison(param, indRun_cal, "Calibration Period")
-
-```
-
-
-
-## 3.0 Model Parameters
-
-We reset the end of the calibration period to end of 2010. The precipitation values in the preceeding two years is absolutely catastrophically low that leads to complete model failure. 
-
+## 3.0 Model Specific Setup
 ```{r}
 # Load the data
 basin_obs_ts <- forcing_q_ts |> 
@@ -347,7 +319,7 @@ indRun_cal <- which(basin_obs_ts$date >= cal_val_per$calib_start &
                       basin_obs_ts$date <= cal_val_per$calib_end)
 indRun_cal_max <- indRun_cal |> max()
 
-# model to use
+# model to use 
 model_2_use <- "GR4J"
 
 if (model_2_use == "GR4J") {
@@ -378,164 +350,13 @@ weights = c(1)
 #fun_crit = list(ErrorCrit_NSE, ErrorCrit_RMSE)
 #weights = c(1/2, 1/2)
 
+# testing custom function
+#fun_crit = ErrorCrit_NSE_Monthly
+#weights = c(1)
+
 # observation
 q_obs_cal = basin_obs_ts$Q_mm_day_no_glacier[indRun_cal]
 q_obs_val = basin_obs_ts$Q_mm_day_no_glacier[indRun_val]
-```
-
-## STEP 2: CALIBRATION MONTHLY
-```{r}
-# Load the data
-basin_obs_ts <- forcing_q_ts |> 
-  rename(Q_mm_day_no_glacier = Q_mm_day)
-
-# Setting calib_end
-cal_val_per$calib_end <- ymd(cal_val_per$calib_end)
-
-# Prepare aggregated monthly observation data
-monthly_obs <- basin_obs_ts %>%
-  mutate(month = floor_date(date, "month")) %>%
-  group_by(month) %>%
-  summarize(Q_mm_day_monthly = mean(Q_mm_day_no_glacier, na.rm = TRUE))
-
-# Find calibration and validation dates at monthly resolution
-monthly_dates <- monthly_obs$month
-
-# Define calibration and validation period indices
-indRun_cal_monthly <- which(monthly_dates >= cal_val_per$calib_start & 
-                          monthly_dates <= cal_val_per$calib_end)
-
-indRun_val_monthly <- which(monthly_dates >= cal_val_per$valid_start & 
-                          monthly_dates <= cal_val_per$valid_end)
-
-# Daily indices for model running
-indRun_cal <- which(basin_obs_ts$date >= cal_val_per$calib_start & 
-                    basin_obs_ts$date <= cal_val_per$calib_end)
-indRun_cal_max <- max(indRun_cal)
-
-indRun_val <- which(basin_obs_ts$date >= cal_val_per$valid_start & 
-                    basin_obs_ts$date <= cal_val_per$valid_end)
-
-# Warmup period
-n_warmup_years <- 3
-warmup_period_ind <- 1:(365*n_warmup_years + 1)
-
-# Adjust calibration period for warmup
-indRun_cal <- indRun_cal + length(warmup_period_ind)
-indRun_cal <- indRun_cal[indRun_cal <= indRun_cal_max]
-
-# Get monthly observations for calibration and validation
-q_obs_cal_monthly <- monthly_obs$Q_mm_day_monthly[indRun_cal_monthly]
-q_obs_val_monthly <- monthly_obs$Q_mm_day_monthly[indRun_val_monthly]
-
-# Model to use
-model_2_use <- "GR4J"
-
-if (model_2_use == "GR4J") {
-  fun_model <- airGR::RunModel_CemaNeigeGR4J
-} else if (model_2_use == "GR5J") {
-  fun_model <- airGR::RunModel_CemaNeigeGR5J
-} else if (model_2_use == "GR6J") {
-  fun_model <- airGR::RunModel_CemaNeigeGR6J
-}
-
-# Transformation
-transfo = ""
-
-# Weights for criteria
-weights = c(1)
-```
-
-## STEP 3: CREATE InputsModel and RunOptions
-```{r}
-# Prepare model inputs
-inputsModel <- airGR::CreateInputsModel(FUN_MOD = fun_model, 
-                                      DatesR = basin_obs_ts$date,
-                                      Precip = basin_obs_ts$Ptot, 
-                                      PotEvap = basin_obs_ts$PET,
-                                      TempMean = basin_obs_ts$Temp, 
-                                      HypsoData = Basin_Info$HypsoData,
-                                      ZInputs = median(Basin_Info$HypsoData),
-                                      NLayers = length(Basin_Info$ZLayers))
-
-# Apply your custom adjustments to inputsModel 
-inputsModel_ours <- inputsModel
-inputsModel_ours$LayerTempMean <- hist_obs_T_bands |> as.list() 
-inputsModel_ours$LayerPrecip <- hist_obs_P_bands |> as.list()
-solid_frac_pr <- solid_fraction_elevation_layer(Basin_Info,
-                                              inputsModel_ours$LayerTempMean, 
-                                              tas_min = 8.56, 
-                                              tas_max = 9.97)
-inputsModel_ours$LayerFracSolidPrecip <- solid_frac_pr
-inputsModel <- inputsModel_ours
-
-# Create run options for calibration
-runOptions_cal <- airGR::CreateRunOptions(FUN_MOD = fun_model,
-                                        InputsModel = inputsModel,
-                                        IndPeriod_Run = indRun_cal,
-                                        IniStates = NULL,
-                                        IniResLevels = NULL,
-                                        IndPeriod_WarmUp = warmup_period_ind,
-                                        IsHyst = FALSE,
-                                        warnings = FALSE)
-```
-
-## STEP 4: Custom InputsCrit and Run Calibration
-```{r}
-# Create InputsCrit using the standard CreateInputsCrit function first
-# This ensures all required components are properly initialized
-inputsCrit_cal_standard <- airGR::CreateInputsCrit(
-  FUN_CRIT = airGR::ErrorCrit_NSE,  # Use standard NSE temporarily
-  InputsModel = inputsModel,
-  RunOptions = runOptions_cal,
-  transfo = transfo,
-  Obs = basin_obs_ts$Q_mm_day_no_glacier[indRun_cal],  # Daily values temporarily
-  Weights = weights
-)
-
-# Now replace only the necessary components for monthly calibration
-inputsCrit_cal <- inputsCrit_cal_standard
-inputsCrit_cal$FUN_CRIT <- ErrorCrit_NSE_Monthly
-inputsCrit_cal$Obs <- q_obs_cal_monthly
-
-# Create calibration options
-calibOptions <- airGR::CreateCalibOptions(FUN_MOD = fun_model, 
-                                        FUN_CALIB = airGR::Calibration_Michel)
-
-# Run calibration with custom objective function
-outputsCalib <- airGR::Calibration_Michel(
-  InputsModel = inputsModel,
-  RunOptions = runOptions_cal,
-  InputsCrit = inputsCrit_cal,
-  CalibOptions = calibOptions,
-  FUN_MOD = fun_model
-)
-
-# Get calibrated parameters
-param <- outputsCalib$ParamFinalR
-```
-
-## STEP 5: Run Model with Calibrated Parameters
-Similar to original code
-```{r}
-# Run the model with calibrated parameters
-if (model_2_use == "GR4J") {
-  runResults_cal <- airGR::RunModel_CemaNeigeGR4J(InputsModel = inputsModel,
-                                               RunOptions = runOptions_cal,
-                                               Param = param)
-} else if (model_2_use == "GR5J") {
-  runResults_cal <- airGR::RunModel_CemaNeigeGR5J(InputsModel = inputsModel,
-                                               RunOptions = runOptions_cal,
-                                               Param = param)
-} else if (model_2_use == "GR6J") {
-  runResults_cal <- airGR::RunModel_CemaNeigeGR6J(InputsModel = inputsModel,
-                                               RunOptions = runOptions_cal,
-                                               Param = param)
-}
-
-# Calculate performance using our custom function
-OutputsCrit <- ErrorCrit_NSE_Monthly(InputsCrit = inputsCrit_cal, OutputsModel = runResults_cal)
-cat("Calibration NSE (monthly):", -OutputsCrit$CritValue, "\n")
 ```
 
 
@@ -606,8 +427,6 @@ outputsCalib <- airGR::Calibration_Michel(InputsModel      = inputsModel,
 
 # 4. RESULTS
 
-NSE = 0.7825
-
 ## 4.1 Calibration Results
 ```{r}
 # calibration period
@@ -615,7 +434,8 @@ param <- outputsCalib$ParamFinalR
 
 # switch call of function depending on fun_model
 if (model_2_use == "GR4J") {
-  runResults_cal <- airGR::RunModel_CemaNeigeGR4J(InputsModel     = inputsModel,
+  runResults_cal <- airGR::RunModel_CemaNeigeGR4J(
+                                           InputsModel     = inputsModel,
                                            RunOptions      = runOptions_cal,
                                            Param           = param)
 } else if (model_2_use == "GR5J") {
@@ -633,7 +453,17 @@ plot(runResults_cal, Qobs = basin_obs_ts$Q_mm_day[indRun_cal])
 OutputsCrit <- airGR::ErrorCrit_NSE(InputsCrit = inputsCrit_cal, OutputsModel = runResults_cal)
 OutputsCrit
 
-dev.off() # required in Positron
+obs_monthly_cal <- q %>%
+  filter(date >= cal_val_per$calib_start & date <= cal_val_per$calib_end)
+
+
+# Plot monthly comparison
+plot_monthly_comparison(
+  runResults_cal,
+  obs_monthly_cal,
+  basin_obs_ts$date[indRun_cal],
+  "Calibration Period"
+)
 ```
 
 ## 4.2 Validation Period
@@ -683,7 +513,17 @@ plot(runResults_val, Qobs = basin_obs_ts$Q_mm_day[indRun_val])
 OutputsCrit <- airGR::ErrorCrit_NSE(InputsCrit = inputsCrit_val, OutputsModel = runResults_val)
 OutputsCrit
 
-dev.off() # required in Positron
+# Get validation observations
+obs_monthly_val <- q %>%
+  filter(date >= cal_val_per$valid_start & date <= cal_val_per$valid_end)
+
+# Plot monthly comparison
+plot_monthly_comparison(
+  runResults_val,
+  obs_monthly_val,
+  basin_obs_ts$date[indRun_val],
+  "Calibration Period"
+)
 ```
 
 # 5. CLIMATE RUNS
