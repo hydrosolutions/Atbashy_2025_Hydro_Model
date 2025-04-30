@@ -100,6 +100,10 @@ p_load(here, tidyverse, lubridate)
 
 path = here::here("01_code", "config_param.R")
 source(path)
+
+# Basin information
+Basin_Info <- read_rds(file.path(config$paths$data_path, "Basin_Info.rds"))
+Basin_Info |> summary()
 ```
 
 ## 1.1 Source functions
@@ -542,8 +546,8 @@ best_performance <- calibration_results$best_performance
 print(best_params)
 print(paste("Best NSE:", best_performance))
 ```
-Run model with best parameters.
 
+Run model with best parameters.
 ```{r}
 # After extracting best parameters from calibration_results
 best_params <- calibration_results$best_params
@@ -660,9 +664,404 @@ plot_parameter_uncertainty(
 
 # 5. RUN MODEL from 2000 - 2024
 
-```{r}
+## 5.0 Model Scenarios
 
+```{r}
+models_Scenarios <- config$climate$fut_sim_models
 ```
+
+
+## 5.1 Forcing
+
+```{r}
+#| warning: false
+#| message: false
+
+# Load the future climate forcing data into a list. Load only those files containing bcsd in their file name.
+forcing_dir <- file.path(config$paths$model_dir, "forcing")
+forcing_files <- list.files(forcing_dir, pattern = "bcsd", full.names = TRUE)
+
+# Load the data
+forcing_data <- lapply(forcing_files, function(x) read_csv(x, show_col_types = FALSE))
+names(forcing_data) <- models_Scenarios
+
+# Let us reverse the order of the forcing data so that we have data ascending in time
+# Split your forcing_data$ERA5 tibble into metadata and data portions
+metadata <- forcing_data$ERA5 %>% slice(1:7)
+data_portion <- forcing_data$ERA5 %>% slice(8:n())
+
+# Convert the dates in the first column to Date objects and sort in ascending order
+data_portion_sorted <- data_portion %>%
+  mutate(date_obj = dmy(as.character(pull(., 1)))) %>%
+  arrange(date_obj) %>%
+  select(-date_obj)  # Remove the temporary date column after sorting
+
+# Recombine the metadata and sorted data portions
+forcing_data_sorted <- bind_rows(metadata, data_portion_sorted)
+
+# Replace the ERA5 component in your forcing_data list
+forcing_data$ERA5 <- forcing_data_sorted
+
+# Process the data
+forcing_data_processed <- lapply(forcing_data, process_rsminerve_climate_files)
+```
+
+## 5.2. Glaciers data, 2000 - 2024
+
+### Data Disaggregation
+
+In this section, we load the glacier data for the future climate scenarios. We will use the glacier data to estimate the glacier contribution to the discharge which is not modelled. For the final results, we will add the simulated discharge to the glacier scenarios to get the total discharge.
+
+```{r}
+# load glacier data which are in the folder ../02_data/Glaciers. Load only data from files containing "glaciers_fut_" in their name.
+glacier_files <- list.files(config$paths$glacier_path, 
+                            pattern = "glaciers_fut_", full.names = TRUE)
+
+# Load the data. After loading, we will have a list of dataframes. 
+scenarios <- c("ssp126", "ssp245", "ssp370", "ssp585")
+models <- 
+glacier_data <- lapply(glacier_files, function(x) read_csv(x, show_col_types = FALSE))
+names(glacier_data) <- scenarios
+
+#For each dataframe, we delete the first 7 rows, rename the first column to date and the second to value. we convert the first column to date format and the last one to dbl. The resulting data are in m3/s. 
+glacier_data <- lapply(glacier_data, function(x) {
+  x <- x |> 
+    # delete first 7 rows
+    slice(-1:-7) |>
+    rename(date = 1, Q_m3_sec = 2) |>
+    mutate(date = dmy_hms(date), 
+           Q_m3_sec = as.numeric(Q_m3_sec),
+           Q_mm_day = Q_m3_sec / as.numeric(Basin_Info$BasinArea_m2) * 10^3 * 3600 * 24)
+})
+
+# Use the function to process all data
+models <- config$climate$fut_sim_models
+glacier_data_disaggregated <- process_glacier_data(
+  glacier_data = glacier_data,
+  forcing_data_processed = forcing_data_processed,
+  gcm_Models = models,
+  gcm_Scenarios = scenarios
+)
+
+# convert glacier_data_disaggregated to dataframe
+glacier_data_disaggregated_df <- map_dfr(names(glacier_data_disaggregated), function(scenario) {
+  map_dfr(names(glacier_data_disaggregated[[scenario]]), function(model) {
+    glacier_data_disaggregated[[scenario]][[model]] %>%
+      mutate(
+        scenario = scenario,
+        model = model
+      )
+  })
+})
+```
+
+### Visual Inspection
+
+```{r}
+# Convert nested list to a single dataframe for plotting
+plot_data <- map_dfr(names(glacier_data_disaggregated), function(scenario) {
+  map_dfr(names(glacier_data_disaggregated[[scenario]]), function(model) {
+    glacier_data_disaggregated[[scenario]][[model]] %>%
+      mutate(
+        scenario = scenario,
+        model = model
+      )
+  })
+}) 
+
+# Create the plot
+pl <- ggplot(plot_data, aes(x = date, y = melt, color = model)) +
+  geom_line(alpha = 0.8) +
+  facet_wrap(~scenario, scales = "fixed", ncol = 2) +
+  theme_minimal() +
+  labs(
+    title = "Disaggregated Daily Glacier Melt by Model and Scenario",
+    x = "Date",
+    y = "Daily Melt (mm/day)",
+    color = "Climate Model"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  scale_color_brewer(palette = "Set2")
+
+# Save the plot if needed
+ggsave("glacier_melt_comparison.png", 
+       path = config$paths$figures,
+       width = 10, height = 6)
+
+
+# save daily glacier melt data (plot_data) as csv file for later analysis
+#write_csv(plot_data, file.path("../05_models/Scenario_simulation", "fut_sim_qgl_mm_models_scenarios.csv"))
+
+# Plot on screen
+pl
+```
+
+These data need to be added to the simulated discharge data to get the total future discharge.
+
+## 5.3 Hydrological Model
+
+### Prep fut_sim
+
+```{r}
+#| warning: false
+#| echo: false
+
+# Forcing data
+fut_sim <- read_csv(file.path(config$paths$model_dir, "forcing/fut_sim_bcsd_ERA5_run_2000_2024.csv"), 
+                     col_names = FALSE,
+                     show_col_types = FALSE)
+
+fut_sim_processed <- process_rsminerve_climate_files(fut_sim)
+
+dates_tbl <- fut_sim %>% 
+    pull(1) %>% 
+    tail(-8) %>% 
+    dmy() %>% 
+    as_tibble()
+fut_sim_T_bands <- fut_sim_processed$T_bands
+fut_sim_P_bands <- fut_sim_processed$P_bands
+
+fut_sim_T <- fut_sim_T_bands |> rowMeans()
+fut_sim_P <- fut_sim_P_bands |> rowMeans()
+
+# Combine the data
+forcing_fut_sim <- data.frame(date   = dates_tbl$value, 
+                          JourJul = yday(dates_tbl$value), # julian day
+                          Ptot    = fut_sim_P, 
+                          Temp    = fut_sim_T) 
+
+# compute potential ET using Oudin method
+PET = airGR::PE_Oudin(JD          = forcing_fut_sim$JourJul, 
+                      Temp        = forcing_fut_sim$Temp, 
+                      Lat         = Basin_Info$BasinLat_rad, 
+                      LatUnit     = "rad", 
+                      TimeStepIn  = "daily", 
+                      TimeStepOut = "daily")
+
+# bind all together
+forcing_fut_sim <- cbind(forcing_fut_sim, PET = PET)
+
+# visualize
+forcing_fut_sim |> 
+  dplyr::select(date, Ptot, Temp, PET) |>
+  pivot_longer(cols = c(Ptot, Temp, PET), names_to = "Variable", values_to = "Value") |> 
+  # generate an interactive plot
+  ggplot(aes(x = date, y = Value, group = Variable)) +
+  geom_line(aes(color = Variable)) +
+  geom_point(aes(color = Variable)) +
+  labs(x = "Date", y = "Value", color = "Variables") +
+  theme_minimal()
+
+# save as csv on disc
+write_csv(forcing_fut_sim, file.path(config$paths$model_dir, "forcing_fut_sim.csv"))
+```
+
+### Model Init
+
+```{r}
+# sort forcing_fut_sim
+forcing_fut_sim <- forcing_fut_sim |> 
+  arrange(date) |> 
+  mutate(date = as.POSIXct(date))
+
+run_start <- ymd(paste0(config$periods$fut_sim_start,"-1-1"))
+run_end <- ymd(paste0(config$periods$fut_sim_end,"-12-31"))
+
+# indexing calibration time steps
+indRun_run <- which(forcing_fut_sim$date >= run_start & 
+                      forcing_fut_sim$date <= run_end)
+indRun_run_max <- indRun_run |> max()
+
+# model to use 
+model_2_use <- "GR4J"
+
+if (model_2_use == "GR4J") {
+  fun_model <- airGR::RunModel_CemaNeigeGR4J
+} else if (model_2_use == "GR5J") {
+  fun_model <- airGR::RunModel_CemaNeigeGR5J
+} else if (model_2_use == "GR6J") {
+  fun_model <- airGR::RunModel_CemaNeigeGR6J
+}
+
+# warmup period
+n_warmup_years <- 3
+warmup_period_ind <- 1 : (365 * n_warmup_years + 1)
+# run period
+indRun_run <- indRun_run + length(warmup_period_ind)
+indRun_run <- indRun_run[indRun_run<=indRun_run_max] # this makes sure that we remain < calib_end period
+
+# transformation
+transfo = ""
+
+# performance criteria
+fun_crit = airGR::ErrorCrit_NSE
+weights = c(1)
+
+# preparation of input data
+inputsModel <- airGR::CreateInputsModel(FUN_MOD            = fun_model, 
+                                        DatesR             = forcing_fut_sim$date,
+                                        Precip             = forcing_fut_sim$Ptot, 
+                                        PotEvap            = forcing_fut_sim$PET,
+                                        TempMean           = forcing_fut_sim$Temp, 
+                                        HypsoData          = Basin_Info$HypsoData,
+                                        ZInputs            = median(Basin_Info$HypsoData),
+                                        NLayers            = length(Basin_Info$ZLayers))
+
+# overwrite airGR CemaNeige elevation bands data with our own.
+inputsModel_ours <- inputsModel
+inputsModel_ours$LayerTempMean <- fut_sim_T_bands |> as.list() 
+inputsModel_ours$LayerPrecip <- fut_sim_P_bands |> as.list()
+
+# compute the fraction of solid precipitation on the layer. 
+# tas_min and tas_max are the best parameters found in the experiment under Section X below.
+
+tas <- c(0.213, 0.489) # tas_min and tas_max are the best parameters found in the experiment under Section X below. in the 
+
+solid_frac_pr <- solid_fraction_elevation_layer(Basin_Info,
+                                                  inputsModel_ours$LayerTempMean, 
+                                                  tas_min  = tas[1], 
+                                                  tas_max  = tas[2]) 
+
+inputsModel_ours$LayerFracSolidPrecip <- solid_frac_pr
+# overwrite original
+inputsModel <- inputsModel_ours
+
+# What we are doing here is to overwrite the setup prepared in the airGR::CreateInputsModel() script. In other words, we just use the data from the data_preparation script.
+runOptions_run <- airGR::CreateRunOptions(FUN_MOD          = fun_model,
+                                          InputsModel      = inputsModel,
+                                          IndPeriod_Run    = indRun_run,
+                                          IniStates        = NULL,
+                                          IniResLevels     = NULL,
+                                          IndPeriod_WarmUp = warmup_period_ind,
+                                          IsHyst           = FALSE,
+                                          warnings         = FALSE,
+                                          Outputs_Sim      = "Qsim")
+```
+
+
+### Model Run
+```{r}
+# After extracting best parameters from calibration_results
+best_params <- calibration_results$best_params
+param_vector <- unlist(best_params)  |> unname()# Convert from list to vector
+
+# Choose the appropriate model function based on your model_type
+if (model_2_use == "GR4J") {
+  model_run <- airGR::RunModel_CemaNeigeGR4J(
+    InputsModel = inputsModel,
+    RunOptions = runOptions_run,
+    Param = param_vector
+  )
+} else if (model_2_use == "GR5J") {
+  model_run <- airGR::RunModel_CemaNeigeGR5J(
+    InputsModel = inputsModel,
+    RunOptions = runOptions_run,
+    Param = param_vector
+  )
+} else if (model_2_use == "GR6J") {
+  model_run <- airGR::RunModel_CemaNeigeGR6J(
+    InputsModel = inputsModel,
+    RunOptions = runOptions_run,
+    Param = param_vector
+  )
+}
+```
+
+### Analysis of Results
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: false
+
+p_load(tidyverse,scales,ggplot2,ggthemes,lubridate,patchwork)
+
+# Create a data frame from the model outputs
+plot_data <- tibble(
+  date = inputsModel$DatesR[runOptions_run$IndPeriod_Run] |> as.Date(),
+  discharge_mm_day = model_run$Qsim
+)
+
+# Convert discharge from mm/day to m³/s
+# Formula: Q(m³/s) = Q(mm/day) × Basin_Area(m²) / (1000 × 86400)
+# Where 1000 converts mm to m, and 86400 converts day to seconds
+plot_data <- plot_data %>%
+  mutate(discharge_m3s = discharge_mm_day * Basin_Info$BasinArea_m2 / (1000 * 86400))
+
+# Filter data for 2017-2023 period
+filtered_data <- plot_data %>%
+  filter(date >= as.Date("2017-01-01") & date <= as.Date("2023-12-31"))
+
+# Create professional plot with daily discharge in m³/s for 2017-2023
+p <- ggplot(filtered_data, aes(x = date, y = discharge_m3s)) +
+  # Daily discharge line
+  geom_line(color = "#2b8cbe", linewidth = 0.6) +
+  
+  # Customize scales
+  scale_x_date(
+    date_breaks = "1 year",
+    date_labels = "%Y",
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_y_continuous(
+    labels = label_number(accuracy = 0.1),
+    expand = expansion(mult = c(0.01, 0.05))
+  ) +
+  
+  # Labels and title
+  labs(
+    title = "Atbashy River Basin Simulated Discharge (2017-2023)",
+    x = "Date",
+    y = expression(paste("Discharge (m"^3, "/s)")),
+    caption = "Source: airGR hydrological model simulation"
+  ) +
+  
+  # Apply clean theme
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0),
+    axis.title = element_text(size = 11, face = "bold"),
+    axis.text = element_text(size = 9),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_line(color = "grey95", linewidth = 0.1),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.2),
+    plot.caption = element_text(size = 9, color = "grey50", hjust = 1),
+    plot.margin = margin(t = 20, r = 20, b = 20, l = 20)
+  )
+
+# Display the plot
+p
+
+# Save the plot with high resolution
+ggsave(
+  filename = file.path(config$paths$figures_path,"atbashy_discharge_m3s_2017-2023.pdf"),
+  plot = p,
+  width = 9,
+  height = 5,
+  dpi = 300,
+  units = "in"
+)
+
+# Also save as PNG for easy viewing
+ggsave(
+  filename = file.path(config$paths$figures_path,"atbashy_discharge_m3s_2017-2023.png"),
+  plot = p,
+  width = 9,
+  height = 5,
+  dpi = 300,
+  units = "in"
+)
+```
+
+
+
+
+
+
 
 
 
