@@ -112,7 +112,8 @@ source(here::here("01_code", "functions", "run_climate_scenarios.R"))
 source(here::here("01_code", "functions", "plot_flexible_hydrograph.R"))
 source(here::here("01_code", "functions", "calculate_exceedance.R"))
 source(here::here("01_code", "functions", "plot_exceedance.R"))
-source(here::here("01_code", "functions", "ErrorCrit_NSE_Monthly.R"))
+source(here::here("01_code", "functions", "adaptive_lhs_calibration.R"))
+source(here::here("01_code", "functions", "parameter_space_visualization_functions.R"))
 ```
 
 # 2. PARAMETERS & DATA
@@ -236,11 +237,9 @@ monthly_melt <- qg_mon |>
 
 ```
 
-### Discharge net Glacier Melt
+### Discharge Net Glacier Melt
 
 ```{r}
-monthly_melt
-
 q <- q |> 
   left_join(monthly_melt, by = "date") |> 
   mutate(melt = ifelse(is.na(melt), 0, melt)) |> 
@@ -351,6 +350,10 @@ weights = c(1)
 #fun_crit = list(ErrorCrit_NSE, ErrorCrit_RMSE)
 #weights = c(1/2, 1/2)
 
+# testing custom function
+#fun_crit = ErrorCrit_NSE_Monthly
+#weights = c(1)
+
 # observation
 q_obs_cal = basin_obs_ts$Q_mm_day_no_glacier[indRun_cal]
 q_obs_val = basin_obs_ts$Q_mm_day_no_glacier[indRun_val]
@@ -359,10 +362,9 @@ q_obs_val = basin_obs_ts$Q_mm_day_no_glacier[indRun_val]
 
 ## 3.1 Prepare Model
 
-Note: We ran the parameter optimization experiment in the X.EXPERIMENT section below. The best parameters for tas_min and tas_max were found to be 8.56 and 9.97, respectively.
+Note: We ran the parameter optimization experiment in the X.EXPERIMENT section below. The best parameters for tas_min and tas_max were found to be 0.213 and 0.489, respectively.
 
 ```{r}
-
 basin_obs_ts <- forcing_q_ts
 
 # preparation of input data
@@ -418,7 +420,203 @@ calibOptions <- airGR::CreateCalibOptions(FUN_MOD          = fun_model,
 ```
 
 
-## 3.2 Model Calibration
+# 4 Model Calibration
+
+## Step 1: Load Required Libraries
+
+Load data and prepare model structure (see above).
+
+## Step 2: Prepare Monthly Observations
+
+```{r}
+# Load discharge data
+q <- readRDS(file.path(paste0(config$paths$data_path,"/Discharge"), "q_cal_val.rds"))
+q <- q |> 
+  mutate(date = ymd(date)) |> 
+  mutate(date = floor_date(date, "month")) |>
+  rename(Q_m3_sec = value) |>
+  mutate(Q_mm_day = Q_m3_sec / as.numeric(Basin_Info$BasinArea_m2) * 10^3 * 3600 * 24)
+
+# Extract calibration period observations
+obs_monthly_cal <- q %>%
+  filter(date >= cal_val_per$calib_start & date <= cal_val_per$calib_end)
+obs_monthly_cal
+```
+
+## Step 3: Define Parameter Ranges
+
+```{r}
+# For GR4J + CemaNeige
+param_ranges <- list(
+  X1 = c(100, 1200),            # Production store capacity (mm)
+  X2 = c(-5, 5),                # Groundwater exchange coefficient (mm/day)
+  X3 = c(20, 300),              # Routing store capacity (mm)
+  X4 = c(0.5, 5),               # Unit hydrograph time constant (days)
+  CemaNeigeParam1 = c(0.5, 2),  # Snow melt temperature factor
+  CemaNeigeParam2 = c(0.5, 2)   # Snow cold content factor
+)
+```
+
+## Step 4: Create Model Run and Evaluation Functions
+
+```{r}
+# Function to run the model with parameters
+run_model_wrapper <- function(params) {
+  # Convert parameters list to vector
+  param_vector <- unlist(params)
+  
+  # Run model
+  results <- airGR::RunModel_CemaNeigeGR4J(
+    InputsModel = inputsModel,
+    RunOptions = runOptions_cal,
+    Param = param_vector
+  )
+  
+  return(results)
+}
+
+# Function to evaluate monthly performance
+eval_function_wrapper <- function(model_results) {
+  # Extract simulated discharge
+  Qsim <- model_results$Qsim
+  
+  # Aggregate to monthly
+  sim_df <- data.frame(
+    date = basin_obs_ts$date[indRun_cal],
+    Qsim = Qsim
+  )
+  sim_df$month_key <- format(sim_df$date, "%Y-%m")
+  sim_monthly <- aggregate(Qsim ~ month_key, data = sim_df, FUN = mean, na.rm = TRUE)
+  
+  # Format observations
+  obs_df <- data.frame(
+    month_key = format(obs_monthly_cal$date, "%Y-%m"),
+    Qobs = obs_monthly_cal$Q_mm_day
+  )
+  
+  # Merge and calculate NSE
+  merged_data <- merge(sim_monthly, obs_df, by = "month_key")
+  
+  # Calculate NSE
+  mean_obs <- mean(merged_data$Qobs, na.rm = TRUE)
+  numerator <- sum((merged_data$Qsim - merged_data$Qobs)^2, na.rm = TRUE)
+  denominator <- sum((merged_data$Qobs - mean_obs)^2, na.rm = TRUE)
+  
+  if (denominator > 0) {
+    nse <- 1 - numerator / denominator
+  } else {
+    nse <- -999
+  }
+  
+  return(nse)
+}
+```
+
+## Step 5: Run Adaptive Calibration with LHS
+
+```{r}
+# Run calibration
+calibration_results <- adaptive_lhs_calibration(
+  run_model = run_model_wrapper,
+  eval_function = eval_function_wrapper,
+  param_ranges = param_ranges,
+  n_initial_samples = 500,    # Number of initial samples
+  n_iterations = 300,          # Number of refinement iterations
+  refinement_factor = 0.2,   # Top 20% used for refinement
+  n_refined_samples = 30,    # Samples per refinement
+  parallel = TRUE           # Set to TRUE for parallel processing
+)
+
+# Extract best parameters
+best_params <- calibration_results$best_params
+best_performance <- calibration_results$best_performance
+
+# Display results
+print(best_params)
+print(paste("Best NSE:", best_performance))
+```
+
+## Step 6: Visualize Calibration Results
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: false
+
+# Plot parameter sensitivity
+plot_parameter_sensitivity(calibration_results$param_df)
+
+# Plot parameter correlations
+plot_parameter_correlations(calibration_results$param_df)
+
+# Plot parameter evolution
+plot_parameter_evolution(calibration_results$param_df)
+
+# Plot monthly comparison
+plot_monthly_comparison(
+  best_run_cal,
+  obs_monthly_cal,
+  basin_obs_ts$date[indRun_cal],
+  "Calibration Period"
+)
+```
+
+## Step 7: Validate the Model
+
+```{r}
+#| warning: false
+#| message: false
+#| echo: false
+
+# Run validation
+runOptions_val <- airGR::CreateRunOptions(
+  FUN_MOD = fun_model,
+  InputsModel = inputsModel,
+  IndPeriod_Run = indRun_val,
+  IniStates = best_run_cal$StateEnd,
+  IniResLevels = NULL
+)
+
+# Run model with best parameters
+param_vector <- unlist(best_params)
+best_run_val <- airGR::RunModel_CemaNeigeGR4J(
+  InputsModel = inputsModel,
+  RunOptions = runOptions_val,
+  Param = param_vector
+)
+
+# Get validation observations
+obs_monthly_val <- q %>%
+  filter(date >= cal_val_per$valid_start & date <= cal_val_per$valid_end)
+
+# Plot validation results
+plot_monthly_comparison(
+  best_run_val,
+  obs_monthly_val,
+  basin_obs_ts$date[indRun_val],
+  "Validation Period"
+)
+```
+
+## Step 8: Analyze Parameter Uncertainty
+
+```{r}
+# Plot parameter uncertainty bands
+plot_parameter_uncertainty(
+  calibration_results,
+  n_best = 10,                 # Use top 10 parameter sets
+  inputsModel = inputsModel,
+  runOptions = runOptions_cal,
+  obs_monthly = obs_monthly_cal,
+  model_type = "GR4J"
+)
+```
+
+
+
+## Old Calibration
+
+
 
 ```{r}
 #| warnings: off
@@ -506,6 +704,8 @@ OutputsCrit <- airGR::ErrorCrit_NSE(InputsCrit = inputsCrit_val, OutputsModel = 
 
 dev.off() # required in Positron
 ```
+
+
 
 
 
