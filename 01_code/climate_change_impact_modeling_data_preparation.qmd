@@ -337,10 +337,30 @@ gauge_Z <- as.numeric(gauge_Z)
 print(paste("Gauge elevation:", gauge_Z, "masl"))
 
 # Calculate the basin area
-basin_area_m2 <- sf::st_area(basin_latlon) |> units::set_units(m2)
-basin_area_km2 <- basin_area_m2 |> units::set_units(km2)
-print(paste("Basin area:", round(basin_area_km2), "km2"))
+gauge_basin_area_m2 <- sf::st_area(basin_latlon) |> units::set_units(m2)
+gauge_basin_area_km2 <- gauge_basin_area_m2 |> units::set_units(km2)
+print(paste("Gauge Basin area:", round(gauge_basin_area_km2), "km2"))
 ```
+
+### Add Basin Shape from Hydropower Station site and compare areas
+```{r}
+basin_hpw_shp <- sf::st_read(dsn = file.path(gis_path, "Atbaschy_Demosite_Basin.gpkg"))
+basin_hpw_utm <- sf::st_transform(basin_hpw_shp, utm42n)
+basin_hpw_latlon <- sf::st_transform(basin_hpw_shp, crs_project)
+
+basin_hpw_latlon |> plot()
+
+# Calculate the basin area
+demo_basin_area_m2 <- sf::st_area(basin_hpw_latlon) |> units::set_units(m2)
+demo_basin_area_km2 <- demo_basin_area_m2 |> units::set_units(km2)
+print(paste("Demo Basin area:", round(demo_basin_area_km2), "km2"))
+
+# Ratio Gauge basin Area to Demo Basin Area
+ratio <- demo_basin_area_m2 / gauge_basin_area_m2
+print(paste("Ratio Gauge basin Area to Demo Basin Area:", round(ratio, 3)))
+```
+
+
 
 ### Hypsometric Curve
 
