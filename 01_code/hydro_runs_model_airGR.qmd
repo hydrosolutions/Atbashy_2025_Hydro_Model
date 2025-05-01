@@ -86,6 +86,9 @@ Challenge: We only have monthly observations and airGR presumes daily observatio
   - Working on the calibration of the GR4J model with daily inputs and monthly discharge observations.
 - **2025-04-30**:
   - Switched to LHS optimization for parameter calibration. First Claude Version available for testing now.
+- **2025-05-01**:
+  - Added daily glacier melt for simulations.
+  - Finalize work.
 
 # ===============================
 
@@ -522,10 +525,10 @@ eval_function_wrapper <- function(model_results) {
 ## Step 5: Run Adaptive Calibration with LHS
 
 ```{r}
-# Run calibration
+# Set random seed for replicability
+set.seed(111) 
 
-set.seed(111)
-
+# Calibration results
 calibration_results <- adaptive_lhs_calibration(
   run_model = run_model_wrapper,
   eval_function = eval_function_wrapper,
@@ -694,7 +697,9 @@ data_portion <- forcing_data$ERA5 %>% slice(8:n())
 data_portion_sorted <- data_portion %>%
   mutate(date_obj = dmy(as.character(pull(., 1)))) %>%
   arrange(date_obj) %>%
-  select(-date_obj)  # Remove the temporary date column after sorting
+  select(-date_obj) %>% # Remove the temporary date column after sorting
+  # convert first column to POSIXct in character format
+  mutate(Station = paste(Station, "00:00:00"))
 
 # Recombine the metadata and sorted data portions
 forcing_data_sorted <- bind_rows(metadata, data_portion_sorted)
@@ -710,29 +715,42 @@ forcing_data_processed <- lapply(forcing_data, process_rsminerve_climate_files)
 
 ### Data Disaggregation
 
-In this section, we load the glacier data for the future climate scenarios. We will use the glacier data to estimate the glacier contribution to the discharge which is not modelled. For the final results, we will add the simulated discharge to the glacier scenarios to get the total discharge.
+In this section, we load the glacier data for the future climate scenarios. We will use the glacier data to estimate the glacier contribution to the discharge which is not modeled. For the final results, we will add the simulated discharge to the glacier scenarios to get the total discharge.
 
 ```{r}
 # load glacier data which are in the folder ../02_data/Glaciers. Load only data from files containing "glaciers_fut_" in their name.
 glacier_files <- list.files(config$paths$glacier_path, 
-                            pattern = "glaciers_fut_", full.names = TRUE)
+                            pattern = "q_glac_2000_2024_m3", full.names = TRUE)
 
 # Load the data. After loading, we will have a list of dataframes. 
-scenarios <- c("ssp126", "ssp245", "ssp370", "ssp585")
-models <- 
+scenarios <- models_Scenarios
+models <- models_Scenarios
 glacier_data <- lapply(glacier_files, function(x) read_csv(x, show_col_types = FALSE))
 names(glacier_data) <- scenarios
 
-#For each dataframe, we delete the first 7 rows, rename the first column to date and the second to value. we convert the first column to date format and the last one to dbl. The resulting data are in m3/s. 
+# The glacier data are in m3/s. We need to convert them to mm/day.
 glacier_data <- lapply(glacier_data, function(x) {
   x <- x |> 
     # delete first 7 rows
     slice(-1:-7) |>
     rename(date = 1, Q_m3_sec = 2) |>
-    mutate(date = dmy_hms(date), 
+    arrange(date) |>
+    mutate(date = ymd_hms(paste(date, "00:00:00")), 
            Q_m3_sec = as.numeric(Q_m3_sec),
-           Q_mm_day = Q_m3_sec / as.numeric(Basin_Info$BasinArea_m2) * 10^3 * 3600 * 24)
+           Q_mm_day = Q_m3_sec / as.numeric(Basin_Info$BasinArea_m2) * 10^3 * 3600 * 24) |> 
+    dplyr::select(-sd)
 })
+
+# First date is August 2000. Just repeat January through July data of 2001 to make a full year.
+# We will use the first 7 months of 2001 to fill the first 7 months of 2000.
+months_2001 <- glacier_data[[models]] |> 
+  filter(year(date) == 2001, month(date) %in% 1:7)
+months_2000 <- months_2001 %>%
+    mutate(date = date - years(1))
+glacier_data[[models]] <- bind_rows(months_2000, glacier_data[[models]] )
+
+# revised process_glacier_data.R function
+source(here::here("01_code", "functions", "process_glacier_data.R"))
 
 # Use the function to process all data
 models <- config$climate$fut_sim_models
@@ -759,7 +777,7 @@ glacier_data_disaggregated_df <- map_dfr(names(glacier_data_disaggregated), func
 
 ```{r}
 # Convert nested list to a single dataframe for plotting
-plot_data <- map_dfr(names(glacier_data_disaggregated), function(scenario) {
+plot_glaciers_data <- map_dfr(names(glacier_data_disaggregated), function(scenario) {
   map_dfr(names(glacier_data_disaggregated[[scenario]]), function(model) {
     glacier_data_disaggregated[[scenario]][[model]] %>%
       mutate(
@@ -770,7 +788,7 @@ plot_data <- map_dfr(names(glacier_data_disaggregated), function(scenario) {
 }) 
 
 # Create the plot
-pl <- ggplot(plot_data, aes(x = date, y = melt, color = model)) +
+pl <- ggplot(plot_glaciers_data, aes(x = date, y = melt, color = model)) +
   geom_line(alpha = 0.8) +
   facet_wrap(~scenario, scales = "fixed", ncol = 2) +
   theme_minimal() +
@@ -942,7 +960,6 @@ runOptions_run <- airGR::CreateRunOptions(FUN_MOD          = fun_model,
                                           Outputs_Sim      = "Qsim")
 ```
 
-
 ### Model Run
 ```{r}
 # After extracting best parameters from calibration_results
@@ -971,7 +988,7 @@ if (model_2_use == "GR4J") {
 }
 ```
 
-### Analysis of Results
+### Analysis of Results: Discharge Net Glacier Melt
 
 ```{r}
 #| warning: false
@@ -981,7 +998,7 @@ if (model_2_use == "GR4J") {
 p_load(tidyverse,scales,ggplot2,ggthemes,lubridate,patchwork)
 
 # Create a data frame from the model outputs
-plot_data <- tibble(
+plot_discharge_data_2003_2024 <- tibble(
   date = inputsModel$DatesR[runOptions_run$IndPeriod_Run] |> as.Date(),
   discharge_mm_day = model_run$Qsim
 )
@@ -989,15 +1006,15 @@ plot_data <- tibble(
 # Convert discharge from mm/day to m³/s
 # Formula: Q(m³/s) = Q(mm/day) × Basin_Area(m²) / (1000 × 86400)
 # Where 1000 converts mm to m, and 86400 converts day to seconds
-plot_data <- plot_data %>%
-  mutate(discharge_m3s = discharge_mm_day * Basin_Info$BasinArea_m2 / (1000 * 86400))
+plot_discharge_data_2003_2024 <- plot_discharge_data_2003_2024 %>%
+  mutate(discharge_m3s = discharge_mm_day * as.numeric(Basin_Info$BasinArea_m2) / (1000 * 86400)) 
 
 # Filter data for 2017-2023 period
-filtered_data <- plot_data %>%
+filtered_discharge_data <- plot_discharge_data_2003_2024 %>%
   filter(date >= as.Date("2017-01-01") & date <= as.Date("2023-12-31"))
 
 # Create professional plot with daily discharge in m³/s for 2017-2023
-p <- ggplot(filtered_data, aes(x = date, y = discharge_m3s)) +
+p <- ggplot(filtered_discharge_data, aes(x = date, y = discharge_m3s)) +
   # Daily discharge line
   geom_line(color = "#2b8cbe", linewidth = 0.6) +
   
@@ -1017,7 +1034,7 @@ p <- ggplot(filtered_data, aes(x = date, y = discharge_m3s)) +
     title = "Atbashy River Basin Simulated Discharge (2017-2023)",
     x = "Date",
     y = expression(paste("Discharge (m"^3, "/s)")),
-    caption = "Source: airGR hydrological model simulation"
+    caption = "Discharge net glacier melt"
   ) +
   
   # Apply clean theme
@@ -1057,6 +1074,65 @@ ggsave(
 )
 ```
 
+### Discharge with Glacier Melt
+
+```{r}
+q_2017_2023 <- filtered_discharge_data |> dplyr::select(-discharge_m3s) |> 
+  rename(q_mm_day = discharge_mm_day)
+q_gl_2017_2023 <- glacier_data_disaggregated_df |> 
+  filter(date >= as.Date("2017-01-01") & date <= as.Date("2023-12-31")) |> 
+  mutate(q_gl_mm_day = melt) |>  # convert to m3/s
+  dplyr::select(date, q_gl_mm_day)
+
+q_plus_ql <- q_2017_2023 |> 
+  left_join(q_gl_2017_2023, by = "date") |> 
+  mutate(q_plus_ql_mm_day = q_mm_day + q_gl_mm_day) 
+  
+# Convert q_plus_ql_mm_day to m3/sec
+q_plus_ql <- q_plus_ql |> 
+  mutate(q_plus_ql_m3_sec = q_plus_ql_mm_day * as.numeric(Basin_Info$BasinArea_m2) / (1000 * 86400))
+
+# Create professional plot with daily discharge in m³/s for 2017-2023
+p <- ggplot(q_plus_ql, aes(x = date)) +
+  # Daily discharge line
+  geom_line(aes(y = q_plus_ql_m3_sec), color = "#2b8cbe", linewidth = 0.6) +
+  
+  # Customize scales
+  scale_x_date(
+    date_breaks = "1 year",
+    date_labels = "%Y",
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_y_continuous(
+    labels = label_number(accuracy = 0.1),
+    expand = expansion(mult = c(0.01, 0.05))
+  ) +
+  
+  # Labels and title
+  labs(
+    title = "Atbashy River Basin Simulated Discharge with Glacier Contribution (2017-2023)",
+    x = "Date",
+    y = expression(paste("Discharge (m"^3, "/s)")),
+    caption = "Discharge with glacier contribution"
+  ) +
+  
+  # Apply clean theme
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0),
+    axis.title = element_text(size = 11, face = "bold"),
+    axis.text = element_text(size = 9),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_line(color = "grey95", linewidth = 0.1),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.2),
+    plot.caption = element_text(size = 9, color = "grey50", hjust = 1),
+    plot.margin = margin(t = 20, r = 20, b = 20, l = 20)
+  )
+
+# Export dataframe q_plus_gl to csv
+write_csv(q_plus_ql, file.path(config$paths$model_dir, "q_plus_gl.csv"))
+
+```
 
 
 

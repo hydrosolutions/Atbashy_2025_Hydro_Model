@@ -64,7 +64,8 @@ process_glacier_data <- function(glacier_data, forcing_data_processed,
     # Loop through each model
     for (model in gcm_Models) {
       # Construct the key for forcing_data_processed
-      key <- paste0(model, "_", scenario)
+      #key <- paste0(model, "_", scenario)
+      key <- model
       
       # Extract temperature data for this model
       if (!is.null(forcing_data_processed[[key]]$T_bands)) {

@@ -1059,7 +1059,7 @@ pl
 
 ## 3.5 Extract Monthly Glacier Discharge from 01/01/2000 through 31/12/2023
 
-We will use airGR for hydrological modeling. Hannah's paper on Atbashy has data analyzed from 2017 - 2024 Let us extract the data for the glacier runoff.
+We will use airGR for hydrological modeling. Hannah's paper on Atbashy has data analyzed from 2017 - 2024. Let us extract the data for the glacier runoff. We call the period 2000 - 2024 fut_sim.
 
 ```{r}
 q_glac_2000_2024 <-
@@ -1067,7 +1067,7 @@ q_glac_2000_2024 <-
      dplyr::filter(date >= ymd(paste0(hist_obs_start, "-01-01")) & date <= ymd(paste0(fut_sim_end,"-12-31"))) |> dplyr::select(-DnstrNode, -model)
 
 # First calculate the ensemble statistics
-q_glac_2000_2024_hist_obs <- q_glac_2000_2024 |> 
+q_glac_2000_2024_m3sec <- q_glac_2000_2024 |> 
   group_by(date) |> 
   summarise(
     Glacier = mean(glac_runoff_m3month) / sec_month,
@@ -1076,7 +1076,7 @@ q_glac_2000_2024_hist_obs <- q_glac_2000_2024 |>
   ungroup()
 
 # Create enhanced plot
-pl <- ggplot(q_glac_2000_2024_hist_obs, aes(x = date, y = Glacier)) +
+pl <- ggplot(q_glac_2000_2024_m3sec, aes(x = date, y = Glacier)) +
   # Add confidence interval
   geom_ribbon(aes(ymin = Glacier - sd, 
                   ymax = Glacier + sd),
@@ -1141,8 +1141,8 @@ ggsave(
 pl
 
 # Save the data
-write_csv(q_glac_2000_2024_hist_obs, 
-          file = file.path(glacier_path, "q_glac_2000_2024_hist_obs.csv"))
+write_csv(q_glac_2000_2024_fut_sim, 
+          file = file.path(glacier_path, "q_glac_2000_2024_m3sec.csv"))
 ```
 
 ## 3.6 Back extension of glacier melt to the 1979 to 1996 period
