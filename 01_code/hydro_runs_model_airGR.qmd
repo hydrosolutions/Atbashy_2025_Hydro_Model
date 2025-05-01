@@ -1129,9 +1129,11 @@ p <- ggplot(q_plus_ql, aes(x = date)) +
     plot.margin = margin(t = 20, r = 20, b = 20, l = 20)
   )
 
+# Plot
+p
+
 # Export dataframe q_plus_gl to csv
 write_csv(q_plus_ql, file.path(config$paths$model_dir, "q_plus_gl.csv"))
-
 ```
 
 
